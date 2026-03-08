@@ -1,8 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { createServer } from "http";
+import { randomUUID } from "crypto";
 
 // --- Config ---
 const SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN || "simple-wallet-panama.myshopify.com";
@@ -523,14 +525,23 @@ const PORT = process.env.PORT;
 const MCP_API_KEY = process.env.MCP_API_KEY;
 
 if (PORT) {
-  // --- Remote mode: HTTP + SSE (for Railway / shared access) ---
-  const sessions = new Map();
+  // --- Remote mode: Streamable HTTP + SSE fallback (for Railway / shared access) ---
+  const httpSessions = new Map();   // Streamable HTTP sessions
+  const sseSessions = new Map();    // Legacy SSE sessions
+
+  // Helper: read request body as JSON
+  async function readBody(req) {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    return JSON.parse(Buffer.concat(chunks).toString());
+  }
 
   const httpServer = createServer(async (req, res) => {
     // CORS headers
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
+    res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
     // Auth check
@@ -552,11 +563,83 @@ if (PORT) {
       return;
     }
 
-    // SSE endpoint — client connects here
+    // =============================================
+    // Streamable HTTP endpoint (new, preferred)
+    // =============================================
+    if (url.pathname === "/mcp") {
+      // POST /mcp — initialize or send messages
+      if (req.method === "POST") {
+        const body = await readBody(req);
+        const sessionId = req.headers["mcp-session-id"];
+
+        // Existing session — route to its transport
+        if (sessionId && httpSessions.has(sessionId)) {
+          const transport = httpSessions.get(sessionId);
+          await transport.handleRequest(req, res, body);
+          return;
+        }
+
+        // New session — must be an initialize request
+        if (!sessionId) {
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (sid) => {
+              httpSessions.set(sid, transport);
+            },
+          });
+          transport.onclose = () => {
+            const sid = transport.sessionId;
+            if (sid) httpSessions.delete(sid);
+          };
+
+          const mcpInstance = new McpServer({ name: "shopify", version: "1.0.0" });
+          registerTools(mcpInstance);
+          await mcpInstance.connect(transport);
+          await transport.handleRequest(req, res, body);
+          return;
+        }
+
+        // Session ID provided but not found
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid session ID" }));
+        return;
+      }
+
+      // GET /mcp — open SSE stream for server-to-client notifications
+      if (req.method === "GET") {
+        const sessionId = req.headers["mcp-session-id"];
+        if (sessionId && httpSessions.has(sessionId)) {
+          const transport = httpSessions.get(sessionId);
+          await transport.handleRequest(req, res);
+          return;
+        }
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Session ID required" }));
+        return;
+      }
+
+      // DELETE /mcp — close session
+      if (req.method === "DELETE") {
+        const sessionId = req.headers["mcp-session-id"];
+        if (sessionId && httpSessions.has(sessionId)) {
+          const transport = httpSessions.get(sessionId);
+          await transport.handleRequest(req, res);
+          httpSessions.delete(sessionId);
+          return;
+        }
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Session not found" }));
+        return;
+      }
+    }
+
+    // =============================================
+    // Legacy SSE endpoints (backward compatibility)
+    // =============================================
     if (url.pathname === "/sse" && req.method === "GET") {
       const transport = new SSEServerTransport("/messages", res);
-      sessions.set(transport.sessionId, transport);
-      transport.onclose = () => sessions.delete(transport.sessionId);
+      sseSessions.set(transport.sessionId, transport);
+      transport.onclose = () => sseSessions.delete(transport.sessionId);
 
       const mcpInstance = new McpServer({ name: "shopify", version: "1.0.0" });
       registerTools(mcpInstance);
@@ -564,20 +647,16 @@ if (PORT) {
       return;
     }
 
-    // Messages endpoint — client sends tool calls here
     if (url.pathname === "/messages" && req.method === "POST") {
       const sessionId = url.searchParams.get("sessionId");
-      const transport = sessions.get(sessionId);
+      const transport = sseSessions.get(sessionId);
       if (!transport) {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Session not found" }));
         return;
       }
-      // Read body
-      const chunks = [];
-      for await (const chunk of req) chunks.push(chunk);
-      const body = Buffer.concat(chunks).toString();
-      req.body = JSON.parse(body);
+      const body = await readBody(req);
+      req.body = body;
       await transport.handlePostMessage(req, res);
       return;
     }
@@ -587,8 +666,9 @@ if (PORT) {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`Shopify MCP server running on port ${PORT} (SSE mode)`);
-    console.log(`SSE endpoint: http://0.0.0.0:${PORT}/sse`);
+    console.log(`Shopify MCP server running on port ${PORT}`);
+    console.log(`Streamable HTTP: http://0.0.0.0:${PORT}/mcp`);
+    console.log(`Legacy SSE:      http://0.0.0.0:${PORT}/sse`);
   });
 } else {
   // --- Local mode: stdio ---
